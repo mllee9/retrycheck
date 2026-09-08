@@ -1,0 +1,12 @@
+[package]
+name = "retrycheck"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Checks a log of retry attempts against a declared backoff policy, one line at a time."
+
+[[bin]]
+name = "retrycheck"
+path = "src/main.rs"
+
+[dependencies]
