@@ -219,3 +219,90 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 5,
+            base_delay_ms: 100,
+            multiplier: 2.0,
+            max_delay_ms: 30_000,
+            jitter: Jitter::None,
+        }
+    }
+
+    fn check_str(input: &str, policy: &RetryPolicy) -> u32 {
+        check(Cursor::new(input.as_bytes()), policy).expect("check should not error on valid input")
+    }
+
+    #[test]
+    fn parse_line_skips_blank_and_comment_lines() {
+        assert!(parse_line("").unwrap().is_none());
+        assert!(parse_line("   ").unwrap().is_none());
+        assert!(parse_line("# checkout-service, order 88213").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_line_reads_a_valid_attempt() {
+        let attempt = parse_line("1717000000101,err").unwrap().unwrap();
+        assert_eq!(attempt.timestamp_ms, 1717000000101);
+        assert!(!attempt.ok);
+
+        let attempt = parse_line("1717000000709,ok").unwrap().unwrap();
+        assert!(attempt.ok);
+    }
+
+    #[test]
+    fn parse_line_rejects_malformed_input() {
+        assert!(parse_line("not-a-line").is_err());
+        assert!(parse_line("abc,err").is_err());
+        assert!(parse_line("1717000000101,maybe").is_err());
+    }
+
+    #[test]
+    fn check_reports_no_violations_for_a_compliant_log() {
+        let log = "1717000000000,err\n1717000000101,err\n1717000000305,err\n1717000000709,ok\n";
+        assert_eq!(check_str(log, &policy()), 0);
+    }
+
+    #[test]
+    fn check_flags_a_gap_that_is_too_short_or_too_long() {
+        let log = "1717000000000,err\n1717000000050,err\n1717000000900,ok\n";
+        assert_eq!(check_str(log, &policy()), 2);
+    }
+
+    #[test]
+    fn check_flags_attempts_past_max_attempts() {
+        let mut p = policy();
+        p.max_attempts = 2;
+        let log = "1717000000000,err\n1717000000100,err\n1717000000300,ok\n";
+        assert_eq!(check_str(log, &p), 1);
+    }
+
+    #[test]
+    fn check_flags_an_attempt_after_success() {
+        let log = "1717000000000,err\n1717000000100,ok\n1717000000300,err\n";
+        assert_eq!(check_str(log, &policy()), 1);
+    }
+
+    #[test]
+    fn check_flags_out_of_order_timestamps() {
+        let log = "1717000000100,err\n1717000000000,err\n";
+        assert_eq!(check_str(log, &policy()), 1);
+    }
+
+    #[test]
+    fn check_ignores_blank_lines_and_comments() {
+        let log = "# order 88213\n1717000000000,err\n\n1717000000101,err\n";
+        assert_eq!(check_str(log, &policy()), 0);
+    }
+
+    #[test]
+    fn check_returns_zero_violations_for_empty_input() {
+        assert_eq!(check_str("", &policy()), 0);
+    }
+}
