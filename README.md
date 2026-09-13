@@ -29,6 +29,32 @@ reshaping it, not written by hand. A shell one-liner or a small script that
 turns structured logs into this format is enough; retrycheck deliberately
 doesn't parse your log format for you.
 
+## Grouped mode
+
+A single request's retry history is the common case, but a log aggregator
+usually hands you an interleaved stream covering many requests at once. Pass
+`--grouped` and add a request id as the middle field:
+
+```
+$ cat many-requests.log
+1717000000000,order-88213,err
+1717000000000,order-91004,err
+1717000000101,order-88213,err
+1717000000230,order-91004,err
+1717000000305,order-88213,ok
+
+$ retrycheck --grouped --base-delay-ms 100 --multiplier 2 many-requests.log
+line 4: [order-91004] attempt 2 waited 230ms, policy expected ~100ms
+order-88213: 3 attempts, 305ms elapsed, 0 violation(s)
+order-91004: 2 attempts, 230ms elapsed, 1 violation(s)
+5 attempts across 2 request(s), 1 violation(s)
+```
+
+Each request id gets its own attempt count, first-seen timestamp, and success
+state, so one id's retries never affect another's, no matter how the lines
+are interleaved. State is kept per request id rather than per line, so memory
+use tracks the number of requests in flight, not the length of the stream.
+
 ## Usage
 
 ```
@@ -68,6 +94,7 @@ a usage or parse error.
 | `--multiplier X`    | 2.0     | growth factor applied per attempt             |
 | `--max-delay-ms N`  | 30000   | cap on the computed delay                     |
 | `--jitter MODE`     | none    | `none` for a fixed delay, `full` for uniform(0, cap) |
+| `--grouped`         | off     | expect `timestamp_ms,request_id,outcome` and check each request id on its own |
 
 ## Why streaming matters here
 
