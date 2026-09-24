@@ -55,6 +55,27 @@ state, so one id's retries never affect another's, no matter how the lines
 are interleaved. State is kept per request id rather than per line, so memory
 use tracks the number of requests in flight, not the length of the stream.
 
+## JSON output
+
+Pass `--format json` to get line-delimited JSON instead of the human-readable
+report, one object per line: a `violation` object as each one is found,
+followed by a closing `summary` (or `group_summary` per request id, in
+grouped mode). This is meant for feeding a dashboard or another script, not
+for reading in a terminal.
+
+```
+$ retrycheck --format json --base-delay-ms 100 --multiplier 2 bad.log
+{"type":"violation","kind":"delay_mismatch","line":2,"attempt":2,"observed_ms":50,"expected_ms":100}
+{"type":"violation","kind":"delay_mismatch","line":3,"attempt":3,"observed_ms":850,"expected_ms":200}
+{"type":"summary","attempts":3,"elapsed_ms":900,"violations":2}
+```
+
+`violation` objects always carry `kind`, `line`, and the fields relevant to
+that kind (`already_succeeded`, `max_attempts_exceeded`,
+`timestamp_out_of_order`, or `delay_mismatch`). Grouped mode adds a
+`request_id` field to every object. Like text mode, this is emitted as each
+line is processed, not buffered and dumped at the end.
+
 ## Usage
 
 ```
@@ -95,6 +116,7 @@ a usage or parse error.
 | `--max-delay-ms N`  | 30000   | cap on the computed delay                     |
 | `--jitter MODE`     | none    | `none` for a fixed delay, `full` for uniform(0, cap) |
 | `--grouped`         | off     | expect `timestamp_ms,request_id,outcome` and check each request id on its own |
+| `--format MODE`     | text    | `text` for the human-readable report, `json` for line-delimited JSON |
 
 ## Why streaming matters here
 

@@ -16,10 +16,21 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::process::ExitCode;
 
+/// How violations and the closing summary are printed. Json emits one
+/// self-contained object per line (violations as they're found, summaries at
+/// the end), so a consumer can stream it the same way retrycheck streams its
+/// own input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 struct Args {
     policy: RetryPolicy,
     input_path: Option<String>,
     grouped: bool,
+    format: OutputFormat,
 }
 
 fn print_usage() {
@@ -43,6 +54,7 @@ options:\n\
   --max-delay-ms N     cap on the computed delay (default 30000)\n\
   --jitter MODE        \"none\" or \"full\" (default none)\n\
   --grouped            expect a request id column and check ids independently\n\
+  --format MODE        \"text\" or \"json\" (default text)\n\
   -h, --help            print this message"
     );
 }
@@ -55,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
     let mut jitter = Jitter::None;
     let mut input_path: Option<String> = None;
     let mut grouped = false;
+    let mut format = OutputFormat::Text;
 
     let mut argv = env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -75,6 +88,13 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--grouped" => grouped = true,
+            "--format" => {
+                format = match next_value(&mut argv, &arg)?.as_str() {
+                    "text" => OutputFormat::Text,
+                    "json" => OutputFormat::Json,
+                    other => return Err(format!("unknown output format '{other}', expected 'text' or 'json'")),
+                }
+            }
             other if other.starts_with('-') => return Err(format!("unknown option '{other}'")),
             other => {
                 if input_path.is_some() {
@@ -95,7 +115,28 @@ fn parse_args() -> Result<Args, String> {
         },
         input_path,
         grouped,
+        format,
     })
+}
+
+/// Escapes a string for embedding in a JSON string literal. The only
+/// user-controlled string that ends up in output is the request id, and log
+/// aggregators do occasionally hand back ids with quotes or control
+/// characters in them.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn next_value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -130,7 +171,7 @@ fn parse_line(line: &str) -> Result<Option<Attempt>, String> {
 
 /// Walks the attempt stream and checks each gap against the policy, printing
 /// violations as they're found. Returns the number of violations seen.
-fn check<R: BufRead>(reader: R, policy: &RetryPolicy) -> Result<u32, String> {
+fn check<R: BufRead>(reader: R, policy: &RetryPolicy, format: OutputFormat) -> Result<u32, String> {
     let mut attempt_num: u32 = 0;
     let mut prev_timestamp_ms: Option<u64> = None;
     let mut first_timestamp_ms: Option<u64> = None;
@@ -149,40 +190,65 @@ fn check<R: BufRead>(reader: R, policy: &RetryPolicy) -> Result<u32, String> {
         first_timestamp_ms.get_or_insert(attempt.timestamp_ms);
 
         if let Some(finished_at) = succeeded_at {
-            println!(
-                "line {}: attempt {attempt_num} fired after attempt {finished_at} already succeeded",
-                line_no + 1
-            );
+            match format {
+                OutputFormat::Text => println!(
+                    "line {}: attempt {attempt_num} fired after attempt {finished_at} already succeeded",
+                    line_no + 1
+                ),
+                OutputFormat::Json => println!(
+                    "{{\"type\":\"violation\",\"kind\":\"already_succeeded\",\"line\":{},\"attempt\":{attempt_num},\"succeeded_at\":{finished_at}}}",
+                    line_no + 1
+                ),
+            }
             violations += 1;
         }
 
         if attempt_num > policy.max_attempts {
-            println!(
-                "line {}: attempt {attempt_num} exceeds the policy's max of {}",
-                line_no + 1,
-                policy.max_attempts
-            );
+            match format {
+                OutputFormat::Text => println!(
+                    "line {}: attempt {attempt_num} exceeds the policy's max of {}",
+                    line_no + 1,
+                    policy.max_attempts
+                ),
+                OutputFormat::Json => println!(
+                    "{{\"type\":\"violation\",\"kind\":\"max_attempts_exceeded\",\"line\":{},\"attempt\":{attempt_num},\"max_attempts\":{}}}",
+                    line_no + 1,
+                    policy.max_attempts
+                ),
+            }
             violations += 1;
         }
 
         if let Some(prev) = prev_timestamp_ms {
             if attempt.timestamp_ms < prev {
-                println!(
-                    "line {}: timestamp {} is before the previous attempt's {}",
-                    line_no + 1,
-                    attempt.timestamp_ms,
-                    prev
-                );
+                match format {
+                    OutputFormat::Text => println!(
+                        "line {}: timestamp {} is before the previous attempt's {}",
+                        line_no + 1,
+                        attempt.timestamp_ms,
+                        prev
+                    ),
+                    OutputFormat::Json => println!(
+                        "{{\"type\":\"violation\",\"kind\":\"timestamp_out_of_order\",\"line\":{},\"timestamp_ms\":{},\"previous_timestamp_ms\":{prev}}}",
+                        line_no + 1,
+                        attempt.timestamp_ms
+                    ),
+                }
                 violations += 1;
             } else {
                 let gap = attempt.timestamp_ms - prev;
                 if !policy.accepts_gap(attempt_num, gap) {
-                    println!(
-                        "line {}: attempt {attempt_num} waited {}ms, policy expected ~{}ms",
-                        line_no + 1,
-                        gap,
-                        policy.expected_delay_ms(attempt_num)
-                    );
+                    let expected = policy.expected_delay_ms(attempt_num);
+                    match format {
+                        OutputFormat::Text => println!(
+                            "line {}: attempt {attempt_num} waited {gap}ms, policy expected ~{expected}ms",
+                            line_no + 1
+                        ),
+                        OutputFormat::Json => println!(
+                            "{{\"type\":\"violation\",\"kind\":\"delay_mismatch\",\"line\":{},\"attempt\":{attempt_num},\"observed_ms\":{gap},\"expected_ms\":{expected}}}",
+                            line_no + 1
+                        ),
+                    }
                     violations += 1;
                 }
             }
@@ -194,13 +260,16 @@ fn check<R: BufRead>(reader: R, policy: &RetryPolicy) -> Result<u32, String> {
         prev_timestamp_ms = Some(attempt.timestamp_ms);
     }
 
-    if let (Some(first), Some(last)) = (first_timestamp_ms, prev_timestamp_ms) {
-        println!(
-            "{attempt_num} attempts, {}ms elapsed, {violations} violation(s)",
-            last - first
-        );
-    } else {
-        println!("no attempts found in input");
+    let elapsed_ms = match (first_timestamp_ms, prev_timestamp_ms) {
+        (Some(first), Some(last)) => last - first,
+        _ => 0,
+    };
+    match format {
+        OutputFormat::Text if first_timestamp_ms.is_none() => println!("no attempts found in input"),
+        OutputFormat::Text => println!("{attempt_num} attempts, {elapsed_ms}ms elapsed, {violations} violation(s)"),
+        OutputFormat::Json => println!(
+            "{{\"type\":\"summary\",\"attempts\":{attempt_num},\"elapsed_ms\":{elapsed_ms},\"violations\":{violations}}}"
+        ),
     }
 
     Ok(violations)
@@ -256,7 +325,7 @@ struct GroupState {
 /// stream covering many concurrent retry sequences can be checked in one
 /// pass. Memory use grows with the number of distinct request ids in flight,
 /// not with the length of the stream.
-fn check_grouped<R: BufRead>(reader: R, policy: &RetryPolicy) -> Result<u32, String> {
+fn check_grouped<R: BufRead>(reader: R, policy: &RetryPolicy, format: OutputFormat) -> Result<u32, String> {
     let mut groups: HashMap<String, GroupState> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut total_attempts: u32 = 0;
@@ -284,44 +353,74 @@ fn check_grouped<R: BufRead>(reader: R, policy: &RetryPolicy) -> Result<u32, Str
 
         state.attempt_num += 1;
 
+        let req_json = json_escape(&req);
+
         if let Some(finished_at) = state.succeeded_at {
-            println!(
-                "line {}: [{req}] attempt {} fired after attempt {finished_at} already succeeded",
-                line_no + 1,
-                state.attempt_num
-            );
+            match format {
+                OutputFormat::Text => println!(
+                    "line {}: [{req}] attempt {} fired after attempt {finished_at} already succeeded",
+                    line_no + 1,
+                    state.attempt_num
+                ),
+                OutputFormat::Json => println!(
+                    "{{\"type\":\"violation\",\"kind\":\"already_succeeded\",\"line\":{},\"request_id\":\"{req_json}\",\"attempt\":{},\"succeeded_at\":{finished_at}}}",
+                    line_no + 1,
+                    state.attempt_num
+                ),
+            }
             state.violations += 1;
         }
 
         if state.attempt_num > policy.max_attempts {
-            println!(
-                "line {}: [{req}] attempt {} exceeds the policy's max of {}",
-                line_no + 1,
-                state.attempt_num,
-                policy.max_attempts
-            );
+            match format {
+                OutputFormat::Text => println!(
+                    "line {}: [{req}] attempt {} exceeds the policy's max of {}",
+                    line_no + 1,
+                    state.attempt_num,
+                    policy.max_attempts
+                ),
+                OutputFormat::Json => println!(
+                    "{{\"type\":\"violation\",\"kind\":\"max_attempts_exceeded\",\"line\":{},\"request_id\":\"{req_json}\",\"attempt\":{},\"max_attempts\":{}}}",
+                    line_no + 1,
+                    state.attempt_num,
+                    policy.max_attempts
+                ),
+            }
             state.violations += 1;
         }
 
         if let Some(prev) = state.prev_timestamp_ms {
             if attempt.timestamp_ms < prev {
-                println!(
-                    "line {}: [{req}] timestamp {} is before the previous attempt's {}",
-                    line_no + 1,
-                    attempt.timestamp_ms,
-                    prev
-                );
+                match format {
+                    OutputFormat::Text => println!(
+                        "line {}: [{req}] timestamp {} is before the previous attempt's {}",
+                        line_no + 1,
+                        attempt.timestamp_ms,
+                        prev
+                    ),
+                    OutputFormat::Json => println!(
+                        "{{\"type\":\"violation\",\"kind\":\"timestamp_out_of_order\",\"line\":{},\"request_id\":\"{req_json}\",\"timestamp_ms\":{},\"previous_timestamp_ms\":{prev}}}",
+                        line_no + 1,
+                        attempt.timestamp_ms
+                    ),
+                }
                 state.violations += 1;
             } else {
                 let gap = attempt.timestamp_ms - prev;
                 if !policy.accepts_gap(state.attempt_num, gap) {
-                    println!(
-                        "line {}: [{req}] attempt {} waited {}ms, policy expected ~{}ms",
-                        line_no + 1,
-                        state.attempt_num,
-                        gap,
-                        policy.expected_delay_ms(state.attempt_num)
-                    );
+                    let expected = policy.expected_delay_ms(state.attempt_num);
+                    match format {
+                        OutputFormat::Text => println!(
+                            "line {}: [{req}] attempt {} waited {gap}ms, policy expected ~{expected}ms",
+                            line_no + 1,
+                            state.attempt_num
+                        ),
+                        OutputFormat::Json => println!(
+                            "{{\"type\":\"violation\",\"kind\":\"delay_mismatch\",\"line\":{},\"request_id\":\"{req_json}\",\"attempt\":{},\"observed_ms\":{gap},\"expected_ms\":{expected}}}",
+                            line_no + 1,
+                            state.attempt_num
+                        ),
+                    }
                     state.violations += 1;
                 }
             }
@@ -337,20 +436,31 @@ fn check_grouped<R: BufRead>(reader: R, policy: &RetryPolicy) -> Result<u32, Str
     for req in &order {
         let state = &groups[req];
         let elapsed = state.prev_timestamp_ms.unwrap_or(state.first_timestamp_ms) - state.first_timestamp_ms;
-        println!(
-            "{req}: {} attempts, {elapsed}ms elapsed, {} violation(s)",
-            state.attempt_num, state.violations
-        );
+        match format {
+            OutputFormat::Text => println!(
+                "{req}: {} attempts, {elapsed}ms elapsed, {} violation(s)",
+                state.attempt_num, state.violations
+            ),
+            OutputFormat::Json => println!(
+                "{{\"type\":\"group_summary\",\"request_id\":\"{}\",\"attempts\":{},\"elapsed_ms\":{elapsed},\"violations\":{}}}",
+                json_escape(req),
+                state.attempt_num,
+                state.violations
+            ),
+        }
         total_violations += state.violations;
     }
 
-    if order.is_empty() {
-        println!("no attempts found in input");
-    } else {
-        println!(
+    match format {
+        OutputFormat::Text if order.is_empty() => println!("no attempts found in input"),
+        OutputFormat::Text => println!(
             "{total_attempts} attempts across {} request(s), {total_violations} violation(s)",
             order.len()
-        );
+        ),
+        OutputFormat::Json => println!(
+            "{{\"type\":\"summary\",\"attempts\":{total_attempts},\"requests\":{},\"violations\":{total_violations}}}",
+            order.len()
+        ),
     }
 
     Ok(total_violations)
@@ -363,18 +473,18 @@ fn run() -> Result<u32, String> {
             let file = File::open(&path).map_err(|e| format!("can't open '{path}': {e}"))?;
             let reader = BufReader::new(file);
             if args.grouped {
-                check_grouped(reader, &args.policy)
+                check_grouped(reader, &args.policy, args.format)
             } else {
-                check(reader, &args.policy)
+                check(reader, &args.policy, args.format)
             }
         }
         None => {
             let stdin = io::stdin();
             let reader = stdin.lock();
             if args.grouped {
-                check_grouped(reader, &args.policy)
+                check_grouped(reader, &args.policy, args.format)
             } else {
-                check(reader, &args.policy)
+                check(reader, &args.policy, args.format)
             }
         }
     }
@@ -407,7 +517,8 @@ mod tests {
     }
 
     fn check_str(input: &str, policy: &RetryPolicy) -> u32 {
-        check(Cursor::new(input.as_bytes()), policy).expect("check should not error on valid input")
+        check(Cursor::new(input.as_bytes()), policy, OutputFormat::Text)
+            .expect("check should not error on valid input")
     }
 
     #[test]
@@ -477,8 +588,24 @@ mod tests {
         assert_eq!(check_str("", &policy()), 0);
     }
 
+    #[test]
+    fn check_counts_violations_the_same_regardless_of_output_format() {
+        let log = "1717000000000,err\n1717000000050,err\n1717000000900,ok\n";
+        let json_count = check(Cursor::new(log.as_bytes()), &policy(), OutputFormat::Json)
+            .expect("check should not error on valid input");
+        assert_eq!(json_count, check_str(log, &policy()));
+    }
+
+    #[test]
+    fn json_escape_handles_quotes_backslashes_and_control_characters() {
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+    }
+
     fn check_grouped_str(input: &str, policy: &RetryPolicy) -> u32 {
-        check_grouped(Cursor::new(input.as_bytes()), policy)
+        check_grouped(Cursor::new(input.as_bytes()), policy, OutputFormat::Text)
             .expect("check_grouped should not error on valid input")
     }
 
@@ -533,5 +660,17 @@ mod tests {
     #[test]
     fn check_grouped_returns_zero_violations_for_empty_input() {
         assert_eq!(check_grouped_str("", &policy()), 0);
+    }
+
+    #[test]
+    fn check_grouped_counts_violations_the_same_regardless_of_output_format() {
+        let log = "\
+1717000000000,a,err\n\
+1717000000050,a,err\n\
+1717000000000,b,err\n\
+1717000000101,b,err\n";
+        let json_count = check_grouped(Cursor::new(log.as_bytes()), &policy(), OutputFormat::Json)
+            .expect("check_grouped should not error on valid input");
+        assert_eq!(json_count, check_grouped_str(log, &policy()));
     }
 }
