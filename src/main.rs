@@ -52,7 +52,7 @@ options:\n\
   --base-delay-ms N    delay before the second attempt (default 100)\n\
   --multiplier X       growth factor applied per attempt (default 2.0)\n\
   --max-delay-ms N     cap on the computed delay (default 30000)\n\
-  --jitter MODE        \"none\" or \"full\" (default none)\n\
+  --jitter MODE        \"none\", \"full\", \"equal\", or \"decorrelated\" (default none)\n\
   --grouped            expect a request id column and check ids independently\n\
   --format MODE        \"text\" or \"json\" (default text)\n\
   -h, --help            print this message"
@@ -84,7 +84,13 @@ fn parse_args() -> Result<Args, String> {
                 jitter = match next_value(&mut argv, &arg)?.as_str() {
                     "none" => Jitter::None,
                     "full" => Jitter::Full,
-                    other => return Err(format!("unknown jitter mode '{other}', expected 'none' or 'full'")),
+                    "equal" => Jitter::Equal,
+                    "decorrelated" => Jitter::Decorrelated,
+                    other => {
+                        return Err(format!(
+                            "unknown jitter mode '{other}', expected 'none', 'full', 'equal', or 'decorrelated'"
+                        ))
+                    }
                 }
             }
             "--grouped" => grouped = true,
@@ -143,6 +149,17 @@ fn next_value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<Str
     argv.next().ok_or_else(|| format!("{flag} expects a value"))
 }
 
+/// Renders a policy's allowed delay range for a text-mode violation message.
+/// Deterministic policies collapse min and max to the same value, so this
+/// prints a single `~Nms` instead of a pointless `Nms-Nms` range.
+fn format_expected_range(min: u64, max: u64) -> String {
+    if min == max {
+        format!("~{min}ms")
+    } else {
+        format!("{min}-{max}ms")
+    }
+}
+
 /// One parsed line of input: a timestamp and whether the attempt succeeded.
 struct Attempt {
     timestamp_ms: u64,
@@ -177,6 +194,9 @@ fn check<R: BufRead>(reader: R, policy: &RetryPolicy, format: OutputFormat) -> R
     let mut first_timestamp_ms: Option<u64> = None;
     let mut succeeded_at: Option<u32> = None;
     let mut violations: u32 = 0;
+    // The delay decorrelated jitter actually observed before the previous attempt;
+    // every other mode ignores this. 0 means "no prior attempt yet".
+    let mut prev_gap_ms: u64 = 0;
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| format!("read error: {e}"))?;
@@ -237,20 +257,22 @@ fn check<R: BufRead>(reader: R, policy: &RetryPolicy, format: OutputFormat) -> R
                 violations += 1;
             } else {
                 let gap = attempt.timestamp_ms - prev;
-                if !policy.accepts_gap(attempt_num, gap) {
-                    let expected = policy.expected_delay_ms(attempt_num);
+                if !policy.accepts_gap(attempt_num, gap, prev_gap_ms) {
+                    let (min, max) = policy.delay_bounds(attempt_num, prev_gap_ms);
                     match format {
                         OutputFormat::Text => println!(
-                            "line {}: attempt {attempt_num} waited {gap}ms, policy expected ~{expected}ms",
-                            line_no + 1
+                            "line {}: attempt {attempt_num} waited {gap}ms, policy expected {}",
+                            line_no + 1,
+                            format_expected_range(min, max)
                         ),
                         OutputFormat::Json => println!(
-                            "{{\"type\":\"violation\",\"kind\":\"delay_mismatch\",\"line\":{},\"attempt\":{attempt_num},\"observed_ms\":{gap},\"expected_ms\":{expected}}}",
+                            "{{\"type\":\"violation\",\"kind\":\"delay_mismatch\",\"line\":{},\"attempt\":{attempt_num},\"observed_ms\":{gap},\"expected_min_ms\":{min},\"expected_max_ms\":{max}}}",
                             line_no + 1
                         ),
                     }
                     violations += 1;
                 }
+                prev_gap_ms = gap;
             }
         }
 
@@ -319,6 +341,7 @@ struct GroupState {
     first_timestamp_ms: u64,
     succeeded_at: Option<u32>,
     violations: u32,
+    prev_gap_ms: u64,
 }
 
 /// Same walk as `check`, but keyed by request id so a single interleaved
@@ -348,6 +371,7 @@ fn check_grouped<R: BufRead>(reader: R, policy: &RetryPolicy, format: OutputForm
                 first_timestamp_ms: attempt.timestamp_ms,
                 succeeded_at: None,
                 violations: 0,
+                prev_gap_ms: 0,
             }
         });
 
@@ -407,22 +431,24 @@ fn check_grouped<R: BufRead>(reader: R, policy: &RetryPolicy, format: OutputForm
                 state.violations += 1;
             } else {
                 let gap = attempt.timestamp_ms - prev;
-                if !policy.accepts_gap(state.attempt_num, gap) {
-                    let expected = policy.expected_delay_ms(state.attempt_num);
+                if !policy.accepts_gap(state.attempt_num, gap, state.prev_gap_ms) {
+                    let (min, max) = policy.delay_bounds(state.attempt_num, state.prev_gap_ms);
                     match format {
                         OutputFormat::Text => println!(
-                            "line {}: [{req}] attempt {} waited {gap}ms, policy expected ~{expected}ms",
+                            "line {}: [{req}] attempt {} waited {gap}ms, policy expected {}",
                             line_no + 1,
-                            state.attempt_num
+                            state.attempt_num,
+                            format_expected_range(min, max)
                         ),
                         OutputFormat::Json => println!(
-                            "{{\"type\":\"violation\",\"kind\":\"delay_mismatch\",\"line\":{},\"request_id\":\"{req_json}\",\"attempt\":{},\"observed_ms\":{gap},\"expected_ms\":{expected}}}",
+                            "{{\"type\":\"violation\",\"kind\":\"delay_mismatch\",\"line\":{},\"request_id\":\"{req_json}\",\"attempt\":{},\"observed_ms\":{gap},\"expected_min_ms\":{min},\"expected_max_ms\":{max}}}",
                             line_no + 1,
                             state.attempt_num
                         ),
                     }
                     state.violations += 1;
                 }
+                state.prev_gap_ms = gap;
             }
         }
 
@@ -555,6 +581,41 @@ mod tests {
     fn check_flags_a_gap_that_is_too_short_or_too_long() {
         let log = "1717000000000,err\n1717000000050,err\n1717000000900,ok\n";
         assert_eq!(check_str(log, &policy()), 2);
+    }
+
+    #[test]
+    fn check_accepts_equal_jitter_within_its_range() {
+        let mut p = policy();
+        p.jitter = Jitter::Equal;
+        // attempt 2's cap is 100 (range [50,100]), attempt 3's is 200 (range [100,200]).
+        let log = "1717000000000,err\n1717000000070,err\n1717000000220,ok\n";
+        assert_eq!(check_str(log, &p), 0);
+    }
+
+    #[test]
+    fn check_flags_equal_jitter_below_its_range() {
+        let mut p = policy();
+        p.jitter = Jitter::Equal;
+        let log = "1717000000000,err\n1717000000040,ok\n";
+        assert_eq!(check_str(log, &p), 1);
+    }
+
+    #[test]
+    fn check_accepts_decorrelated_jitter_carrying_the_previous_gap_forward() {
+        let mut p = policy();
+        p.jitter = Jitter::Decorrelated;
+        // attempt 2 has no prior gap yet, so its range is [base, base*3] = [100,300].
+        // attempt 3's range is based on attempt 2's actual gap of 150: [100,450].
+        let log = "1717000000000,err\n1717000000150,err\n1717000000550,ok\n";
+        assert_eq!(check_str(log, &p), 0);
+    }
+
+    #[test]
+    fn check_flags_decorrelated_jitter_past_three_times_the_previous_gap() {
+        let mut p = policy();
+        p.jitter = Jitter::Decorrelated;
+        let log = "1717000000000,err\n1717000000150,err\n1717000000900,ok\n";
+        assert_eq!(check_str(log, &p), 1);
     }
 
     #[test]

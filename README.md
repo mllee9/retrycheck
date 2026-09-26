@@ -65,8 +65,8 @@ for reading in a terminal.
 
 ```
 $ retrycheck --format json --base-delay-ms 100 --multiplier 2 bad.log
-{"type":"violation","kind":"delay_mismatch","line":2,"attempt":2,"observed_ms":50,"expected_ms":100}
-{"type":"violation","kind":"delay_mismatch","line":3,"attempt":3,"observed_ms":850,"expected_ms":200}
+{"type":"violation","kind":"delay_mismatch","line":2,"attempt":2,"observed_ms":50,"expected_min_ms":100,"expected_max_ms":100}
+{"type":"violation","kind":"delay_mismatch","line":3,"attempt":3,"observed_ms":850,"expected_min_ms":200,"expected_max_ms":200}
 {"type":"summary","attempts":3,"elapsed_ms":900,"violations":2}
 ```
 
@@ -114,9 +114,29 @@ a usage or parse error.
 | `--base-delay-ms N` | 100     | delay before the second attempt               |
 | `--multiplier X`    | 2.0     | growth factor applied per attempt             |
 | `--max-delay-ms N`  | 30000   | cap on the computed delay                     |
-| `--jitter MODE`     | none    | `none` for a fixed delay, `full` for uniform(0, cap) |
+| `--jitter MODE`     | none    | `none`, `full`, `equal`, or `decorrelated` (see below) |
 | `--grouped`         | off     | expect `timestamp_ms,request_id,outcome` and check each request id on its own |
 | `--format MODE`     | text    | `text` for the human-readable report, `json` for line-delimited JSON |
+
+## Jitter modes
+
+`--jitter` controls how a single deterministic delay per attempt (`none`)
+turns into a range, and what counts as compliant within that range:
+
+* `none` - the delay must match the computed value, within a 5ms tolerance
+  for clock and scheduler skew.
+* `full` - delay is uniform(0, cap), so any gap up to the cap is accepted.
+* `equal` - delay is uniform(cap/2, cap): half the cap is fixed, the other
+  half is jittered. Accepted range is `[cap/2, cap]`.
+* `decorrelated` - each delay is uniform(base_delay_ms, previous_delay * 3),
+  capped at max_delay_ms. Unlike the other modes, the accepted range for one
+  attempt depends on the delay actually observed before the previous one, not
+  on the attempt number by itself, so retrycheck carries the last observed
+  gap forward as it walks the stream.
+
+For `full`, `equal`, and `decorrelated`, a `delay_mismatch` violation reports
+`expected_min_ms` and `expected_max_ms` instead of a single value, since
+there's no single correct delay to compare against.
 
 ## Why streaming matters here
 
@@ -130,8 +150,8 @@ piping a ten-line one.
 ## Status
 
 Early. The policy model covers exponential backoff with an optional cap and
-either no jitter or full jitter, which covers the common cases but not every
-library's exact scheme. See the roadmap for what's next.
+four jitter modes (none, full, equal, decorrelated), which covers most
+libraries' backoff schemes. See the roadmap for what's next.
 
 ## License
 
